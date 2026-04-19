@@ -12,7 +12,9 @@ import {
   Maximize2,
   Trash2,
   Image as ImageIcon,
-  Zap
+  Zap,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { GoogleGenAI, Type } from "@google/genai";
 import JSZip from 'jszip';
@@ -72,17 +74,6 @@ export default function ImageSplitter() {
 
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setSelectedImageId(null);
-        if (viewMode === 'gallery') setViewMode('edit');
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [viewMode]);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -510,6 +501,22 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
     document.body.removeChild(link);
   };
 
+  const navigateInspection = useCallback((direction: 'next' | 'prev') => {
+    if (!selectedImageId || extractedImages.length <= 1) return;
+    
+    const currentIndex = extractedImages.findIndex(img => img.id === selectedImageId);
+    if (currentIndex === -1) return;
+    
+    let nextIndex: number;
+    if (direction === 'next') {
+      nextIndex = (currentIndex + 1) % extractedImages.length;
+    } else {
+      nextIndex = (currentIndex - 1 + extractedImages.length) % extractedImages.length;
+    }
+    
+    setSelectedImageId(extractedImages[nextIndex].id);
+  }, [selectedImageId, extractedImages]);
+
   const handleWheel = (e: React.WheelEvent) => {
     if (!sourceImage) return;
     e.preventDefault();
@@ -521,6 +528,56 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
       return Math.min(5, Math.max(0.05, newZoom));
     });
   };
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // ESC
+      if (e.key === 'Escape') {
+        setSelectedImageId(null);
+        if (viewMode === 'gallery') setViewMode('edit');
+      }
+      
+      // Delete (Clear History)
+      if (e.key === 'Delete' && extractedImages.length > 0) {
+        setExtractedImages([]);
+      }
+      
+      // Ctrl + Enter (Trigger AI)
+      if (e.ctrlKey && e.key === 'Enter') {
+        if (!isDetecting && sourceImage) {
+          autoDetectWithAI();
+        }
+      }
+
+      // Lightbox Navigation
+      if (selectedImageId && extractedImages.length > 1) {
+        if (e.key === 'ArrowRight') navigateInspection('next');
+        if (e.key === 'ArrowLeft') navigateInspection('prev');
+      }
+    };
+
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (items) {
+        for (let i = 0; i < items.length; i++) {
+          if (items[i].type.indexOf('image') !== -1) {
+            const file = items[i].getAsFile();
+            if (file) {
+              processFile(file);
+              break;
+            }
+          }
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('paste', handlePaste);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('paste', handlePaste);
+    };
+  }, [viewMode, extractedImages, isDetecting, sourceImage, autoDetectWithAI, selectedImageId, navigateInspection]);
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-bg text-text font-sans flex flex-col">
@@ -902,14 +959,43 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
       </main>
 
       {/* Footer */}
-      <footer className="h-[30px] bg-panel border-t border-border px-5 flex items-center text-[11px] text-text-dim gap-8 flex-shrink-0 z-30">
+      <footer className="h-[30px] bg-panel border-t border-border px-5 flex items-center text-[10px] text-text-dim gap-8 flex-shrink-0 z-30">
         <div className="flex items-center gap-2">
-          <span className="text-accent">●</span>
-          <span>Trạng thái: {sourceImage ? 'Sẵn sàng tách ảnh' : 'Đang chờ tệp tin'}</span>
+          <span className="text-accent animate-pulse">●</span>
+          <span className="font-bold">TRẠNG THÁI:</span>
+          <span>{sourceImage ? 'SẴN SÀNG' : 'CHỜ TỆP TIN'}</span>
         </div>
-        <div>Tệp tin: {sourceImage ? 'Project_Composite_Final.tiff' : 'N/A'}</div>
-        <div className="ml-auto text-success font-bold">
-          {sourceImage ? `${sourceImage.width} × ${sourceImage.height} PX` : ''}
+        
+        <div className="flex items-center gap-6 border-l border-white/5 pl-6">
+          <div className="flex items-center gap-2">
+            <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">CTRL+V</kbd>
+            <span className="uppercase opacity-60">Dán ảnh</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">DELETE</kbd>
+            <span className="uppercase opacity-60">Xóa lịch sử</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">CTRL+ENTER</kbd>
+            <span className="uppercase opacity-60">Tư động tách</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">ESC</kbd>
+            <span className="uppercase opacity-60">Thoát Zoom</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">← / →</kbd>
+            <span className="uppercase opacity-60">Chuyển ảnh</span>
+          </div>
+        </div>
+
+        <div className="ml-auto flex items-center gap-4 text-success font-bold uppercase">
+          {sourceImage && (
+            <>
+              <div className="w-px h-3 bg-white/5" />
+              <span>{sourceImage.width} × {sourceImage.height} PX</span>
+            </>
+          )}
         </div>
       </footer>
 
@@ -1014,6 +1100,25 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
               onClick={e => e.stopPropagation()}
             >
               <div className="relative group p-1.5 bg-white/5 rounded-xl border border-white/10 shadow-[0_50px_100px_rgba(0,0,0,1)]">
+                {extractedImages.length > 1 && (
+                  <>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); navigateInspection('prev'); }}
+                      className="absolute -left-20 top-1/2 -translate-y-1/2 w-16 h-16 flex items-center justify-center bg-white/5 hover:bg-white/10 border border-white/10 rounded-full text-white/40 hover:text-white transition-all z-[110]"
+                      title="Quay lại (Arrow Left)"
+                    >
+                      <ChevronLeft size={32} />
+                    </button>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); navigateInspection('next'); }}
+                      className="absolute -right-20 top-1/2 -translate-y-1/2 w-16 h-16 flex items-center justify-center bg-white/5 hover:bg-white/10 border border-white/10 rounded-full text-white/40 hover:text-white transition-all z-[110]"
+                      title="Tiếp theo (Arrow Right)"
+                    >
+                      <ChevronRight size={32} />
+                    </button>
+                  </>
+                )}
+
                 <img 
                   src={extractedImages.find(i => i.id === selectedImageId)?.url} 
                   alt="Inspection View" 
