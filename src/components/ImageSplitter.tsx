@@ -61,6 +61,7 @@ export default function ImageSplitter() {
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
 
   // Gemini Setup
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -68,7 +69,9 @@ export default function ImageSplitter() {
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [activeHandle, setActiveHandle] = useState<string | null>(null);
-  const [action, setAction] = useState<'selecting' | 'moving' | 'scaling' | 'none'>('none');
+  const [action, setAction] = useState<'selecting' | 'moving' | 'scaling' | 'panning' | 'none'>('none');
+  const [lastMousePos, setLastMousePos] = useState({ x: 0, y: 0 });
+  const [smartClickPos, setSmartClickPos] = useState<{ x: number, y: number } | null>(null);
 
   const HANDLE_SIZE = 8;
 
@@ -220,6 +223,17 @@ export default function ImageSplitter() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
 
+    // Smart Click Marker
+    if (smartClickPos) {
+      ctx.beginPath();
+      ctx.arc(smartClickPos.x * zoom, smartClickPos.y * zoom, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ef4444';
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
     if (selection) {
       const sx = selection.x * zoom;
       const sy = selection.y * zoom;
@@ -254,8 +268,17 @@ export default function ImageSplitter() {
 
   const handleMouseDown = (e: React.MouseEvent) => {
     if (!sourceImage) return;
-    const { x, y } = getCanvasMousePos(e);
 
+    // Middle Click Pan
+    if (e.button === 1) {
+      setAction('panning');
+      setLastMousePos({ x: e.clientX, y: e.clientY });
+      e.preventDefault();
+      return;
+    }
+
+    const { x, y } = getCanvasMousePos(e);
+    
     if (selection) {
       const sx = selection.x;
       const sy = selection.y;
@@ -287,6 +310,15 @@ export default function ImageSplitter() {
 
   const handleMouseMove = (e: React.MouseEvent) => {
     if (!sourceImage || action === 'none') return;
+
+    if (action === 'panning') {
+      const dx = e.clientX - lastMousePos.x;
+      const dy = e.clientY - lastMousePos.y;
+      setOffset(prev => ({ x: prev.x + dx, y: prev.y + dy }));
+      setLastMousePos({ x: e.clientX, y: e.clientY });
+      return;
+    }
+
     const { x, y } = getCanvasMousePos(e);
 
     if (action === 'selecting') {
@@ -324,7 +356,13 @@ export default function ImageSplitter() {
     }
   };
 
-  const handleMouseUp = () => {
+  const handleMouseUp = (e: React.MouseEvent) => {
+    if (action === 'selecting' && selection && selection.width < 5 && selection.height < 5) {
+      // Smart Point Detection
+      const { x, y } = getCanvasMousePos(e);
+      smartDetectAtPoint(x, y);
+      setSelection(null);
+    }
     setAction('none');
     setActiveHandle(null);
   };
@@ -359,6 +397,118 @@ export default function ImageSplitter() {
       }
     }
     setExtractedImages(prev => [...prev, ...newExtractions]);
+  };
+
+  const smartDetectAtPoint = async (rawX: number, rawY: number) => {
+    if (!sourceImage) return;
+    setIsDetecting(true);
+    setSmartClickPos({ x: rawX, y: rawY });
+
+    try {
+      // Get base64 - Standardized resolution
+      const canvas = document.createElement('canvas');
+      const maxDim = 1536;
+      const scale = Math.min(maxDim / sourceImage.width, maxDim / sourceImage.height);
+      canvas.width = sourceImage.width * scale;
+      canvas.height = sourceImage.height * scale;
+      const ctx = canvas.getContext('2d');
+      ctx?.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
+      const base64 = canvas.toDataURL('image/jpeg', 0.95).split(',')[1];
+
+      // Convert raw point to 0-1000 scale
+      const px = Math.round((rawX / sourceImage.width) * 1000);
+      const py = Math.round((rawY / sourceImage.height) * 1000);
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [
+          { inlineData: { mimeType: 'image/jpeg', data: base64 } },
+          { text: `INSTRUCTION: Locate the exact bounding box for the single image panel that contains the target point [x:${px}, y:${py}]. 
+          
+IMAGE INFO:
+- Original Dimensions: ${sourceImage.width}x${sourceImage.height}
+- Point is relative to 1000x1000 grid.
+
+RULES:
+1. Identify the PHYSICAL boundaries (gutters or divider lines) of the sub-image at the specified coordinates.
+2. Return ONLY the JSON for that specific panel.
+3. Box must be tightly fitted to the panel content.
+4. COORDINATE SYSTEM: 0-1000 for x, y, width, height.
+
+Output ONLY a JSON object with 'x', 'y', 'width', 'height'.` }
+        ],
+        config: { 
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY, // Using array just in case model wants to wrap it, but logic expects object
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                x: { type: Type.NUMBER },
+                y: { type: Type.NUMBER },
+                width: { type: Type.NUMBER },
+                height: { type: Type.NUMBER }
+              },
+              required: ["x", "y", "width", "height"]
+            }
+          }
+        }
+      });
+
+      const responseText = response.text;
+      const parsed = JSON.parse(responseText);
+      const box = Array.isArray(parsed) ? parsed[0] : parsed;
+      
+      if (!box) return;
+
+      const sx = (box.x / 1000) * sourceImage.width;
+      const sy = (box.y / 1000) * sourceImage.height;
+      const sw = (box.width / 1000) * sourceImage.width;
+      const sh = (box.height / 1000) * sourceImage.height;
+
+      // Extract high-res
+      const rawCanvas = document.createElement('canvas');
+      rawCanvas.width = sw;
+      rawCanvas.height = sh;
+      const rawCtx = rawCanvas.getContext('2d');
+      if (rawCtx) {
+        rawCtx.drawImage(sourceImage, sx, sy, sw, sh, 0, 0, sw, sh);
+        
+        const targetMinDim = 2048;
+        let outputWidth = sw;
+        let outputHeight = sh;
+        const aspectRatio = sw / sh;
+        if (sw < targetMinDim || sh < targetMinDim) {
+           if (aspectRatio > 1) { outputWidth = targetMinDim; outputHeight = targetMinDim / aspectRatio; }
+           else { outputHeight = targetMinDim; outputWidth = targetMinDim * aspectRatio; }
+        }
+
+        const upscaleCanvas = document.createElement('canvas');
+        upscaleCanvas.width = outputWidth;
+        upscaleCanvas.height = outputHeight;
+        const upscaleCtx = upscaleCanvas.getContext('2d');
+        if (upscaleCtx) {
+          upscaleCtx.imageSmoothingEnabled = true;
+          upscaleCtx.imageSmoothingQuality = 'high';
+          upscaleCtx.drawImage(rawCanvas, 0, 0, outputWidth, outputHeight);
+          sharpenImage(upscaleCanvas);
+
+          const newImg = {
+            id: Math.random().toString(36).substr(2, 9),
+            url: upscaleCanvas.toDataURL('image/png'),
+            rect: { x: sx, y: sy, width: sw, height: sh },
+            originalWidth: Math.round(outputWidth),
+            originalHeight: Math.round(outputHeight)
+          };
+          setExtractedImages(prev => [...prev, newImg]);
+        }
+      }
+    } catch (error) {
+      console.error("Smart detect failed:", error);
+    } finally {
+      setIsDetecting(false);
+      setTimeout(() => setSmartClickPos(null), 1000);
+    }
   };
 
   const autoDetectWithAI = async () => {
@@ -788,11 +938,13 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
 
         {/* Workspace (Center) */}
         <section 
-          className="bg-[#050505] flex items-center justify-center relative overflow-auto scrollbar-hide p-20"
+          ref={workspaceRef}
+          className="bg-[#050505] flex items-center justify-center relative overflow-hidden scrollbar-hide p-20"
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           onWheel={handleWheel}
+          onContextMenu={(e) => e.preventDefault()}
         >
           {!sourceImage ? (
             <div 
@@ -816,8 +968,9 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
             <div 
               className="relative transition-all duration-300 ease-out flex items-center justify-center"
               style={{
-                width: Math.max(800, sourceImage.width * zoom + 100),
-                height: Math.max(600, sourceImage.height * zoom + 100),
+                width: sourceImage.width * zoom,
+                height: sourceImage.height * zoom,
+                transform: `translate(${offset.x}px, ${offset.y}px)`
               }}
             >
                <div className="relative p-1 bg-border rounded-sm shadow-[0_40px_100px_rgba(0,0,0,0.8)]">
@@ -986,6 +1139,14 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
           <div className="flex items-center gap-2">
             <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">← / →</kbd>
             <span className="uppercase opacity-60">Chuyển ảnh</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">MID-CLICK</kbd>
+            <span className="uppercase opacity-60">Pan iMG</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">CLICK</kbd>
+            <span className="uppercase opacity-60">Smart Select</span>
           </div>
         </div>
 
