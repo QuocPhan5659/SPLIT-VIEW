@@ -399,23 +399,181 @@ export default function ImageSplitter() {
     setExtractedImages(prev => [...prev, ...newExtractions]);
   };
 
+  const refineRectWithPixels = (rect: Rect, img: HTMLImageElement): Rect => {
+    const canvas = document.createElement('canvas');
+    // Using a smaller scale for boundary scanning to avoid huge memory usage, 
+    // but enough to resolve a 1px gutter.
+    const scanScale = 1; 
+    canvas.width = img.width * scanScale;
+    canvas.height = img.height * scanScale;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return rect;
+
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    let { x, y, width, height } = rect;
+    x = Math.round(x * scanScale);
+    y = Math.round(y * scanScale);
+    width = Math.round(width * scanScale);
+    height = Math.round(height * scanScale);
+
+    const isGutterPixel = (r: number, g: number, b: number) => {
+      const brightness = (r + g + b) / 3;
+      const variance = Math.max(r, g, b) - Math.min(r, g, b);
+      if (variance > 15) return false; // Not a neutral divider
+      return brightness > 225 || brightness < 30;
+    };
+
+    // Grab horizontal and vertical search strips to minimize getImageData calls
+    const searchMargin = Math.round(Math.max(canvas.width, canvas.height) * 0.08); // Search 8% inward/outward
+    
+    const checkLineIsGutter = (pos: number, axis: 'x' | 'y', start: number, end: number) => {
+      const samples = 30;
+      let gutterScore = 0;
+      for (let i = 0; i < samples; i++) {
+        const s = Math.round(start + (i * (end - start)) / (samples - 1));
+        const px = axis === 'x' ? pos : s;
+        const py = axis === 'x' ? s : pos;
+        if (px < 0 || px >= canvas.width || py < 0 || py >= canvas.height) continue;
+        const p = ctx.getImageData(px, py, 1, 1).data;
+        if (isGutterPixel(p[0], p[1], p[2])) gutterScore++;
+      }
+      return gutterScore / samples > 0.8;
+    };
+
+    const findBoundary = (initial: number, axis: 'x' | 'y', start: number, end: number, dir: 1 | -1) => {
+      let current = initial;
+      // 1. If currently on gutter, move INWARD to content
+      if (checkLineIsGutter(current, axis, start, end)) {
+        for (let i = 0; i < searchMargin; i++) {
+          const next = current + dir;
+          if (next < 0 || (axis === 'x' ? next >= canvas.width : next >= canvas.height)) break;
+          if (!checkLineIsGutter(next, axis, start, end)) return next;
+          current = next;
+        }
+      } else {
+        // 2. If currently on content, move OUTWARD to gutter boundary
+        for (let i = 0; i < searchMargin; i++) {
+          const next = current - dir;
+          if (next < 0 || (axis === 'x' ? next >= canvas.width : next >= canvas.height)) break;
+          if (checkLineIsGutter(next, axis, start, end)) return next + dir;
+          current = next;
+        }
+      }
+      return initial;
+    };
+
+    const fx = findBoundary(x, 'x', y, y + height, 1);
+    const fw = findBoundary(x + width, 'x', y, y + height, -1) - fx;
+    const fy = findBoundary(y, 'y', fx, fx + fw, 1);
+    const fh = findBoundary(y + height, 'y', fx, fx + fw, -1) - fy;
+
+    return {
+      x: fx / scanScale,
+      y: fy / scanScale,
+      width: Math.max(20, fw / scanScale),
+      height: Math.max(20, fh / scanScale)
+    };
+  };
+
+  const autoDetectGridProgrammatic = (img: HTMLImageElement): Rect[] => {
+    // Advanced Structural Analysis: Hierarchical Row-then-Column scanning
+    const canvas = document.createElement('canvas');
+    const scale = 0.2; 
+    canvas.width = img.width * scale;
+    canvas.height = img.height * scale;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return [];
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+    const isGutter = (r: number, g: number, b: number) => {
+      const bri = (r + g + b) / 3;
+      const var_val = Math.max(r,g,b) - Math.min(r,g,b);
+      return var_val < 25 && (bri > 190 || bri < 55);
+    };
+
+    // Helper for finding continuous regions between gutters
+    const findRegions = (gutters: boolean[], size: number) => {
+      const regions: {start: number, end: number}[] = [];
+      let inContent = false;
+      let start = 0;
+      for (let i = 0; i < size; i++) {
+        if (!gutters[i] && !inContent) {
+          inContent = true;
+          start = i;
+        } else if (gutters[i] && inContent) {
+          inContent = false;
+          if (i - start > size * 0.05) regions.push({start, end: i});
+        }
+      }
+      if (inContent) regions.push({start, end: size});
+      return regions;
+    };
+
+    // 1. Detect GLOBAL ROWS
+    const rowGutter = new Array(canvas.height).fill(0);
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const idx = (y * canvas.width + x) * 4;
+        if (isGutter(data[idx], data[idx+1], data[idx+2])) {
+          rowGutter[y]++;
+        }
+      }
+    }
+    const rowGutterB = rowGutter.map(count => count > canvas.width * 0.96);
+    const rowRegions = findRegions(rowGutterB, canvas.height);
+
+    const finalRects: Rect[] = [];
+
+    // 2. For each ROW, detect COLUMNS independently
+    rowRegions.forEach(row => {
+      const colGutter = new Array(canvas.width).fill(0);
+      for (let x = 0; x < canvas.width; x++) {
+        for (let y = row.start; y < row.end; y++) {
+          const idx = (y * canvas.width + x) * 4;
+          if (isGutter(data[idx], data[idx+1], data[idx+2])) {
+            colGutter[x]++;
+          }
+        }
+      }
+
+      const rowHeight = row.end - row.start;
+      const colGutterB = colGutter.map(count => count > rowHeight * 0.96);
+      const colRegions = findRegions(colGutterB, canvas.width);
+      
+      colRegions.forEach(col => {
+        finalRects.push({
+          x: col.start / scale,
+          y: row.start / scale,
+          width: (col.end - col.start) / scale,
+          height: (row.end - row.start) / scale
+        });
+      });
+    });
+
+    return finalRects;
+  };
+
   const smartDetectAtPoint = async (rawX: number, rawY: number) => {
     if (!sourceImage) return;
     setIsDetecting(true);
     setSmartClickPos({ x: rawX, y: rawY });
 
     try {
-      // Get base64 - Standardized resolution
       const canvas = document.createElement('canvas');
-      const maxDim = 1536;
+      const maxDim = 2048; // Higher res for pixel-perfect edge detection
       const scale = Math.min(maxDim / sourceImage.width, maxDim / sourceImage.height);
       canvas.width = sourceImage.width * scale;
       canvas.height = sourceImage.height * scale;
       const ctx = canvas.getContext('2d');
-      ctx?.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
-      const base64 = canvas.toDataURL('image/jpeg', 0.95).split(',')[1];
+      if (ctx) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
+      }
+      const base64 = canvas.toDataURL('image/jpeg', 0.9).split(',')[1];
 
-      // Convert raw point to 0-1000 scale
       const px = Math.round((rawX / sourceImage.width) * 1000);
       const py = Math.round((rawY / sourceImage.height) * 1000);
 
@@ -423,34 +581,32 @@ export default function ImageSplitter() {
         model: "gemini-3-flash-preview",
         contents: [
           { inlineData: { mimeType: 'image/jpeg', data: base64 } },
-          { text: `INSTRUCTION: Locate the exact bounding box for the single image panel that contains the target point [x:${px}, y:${py}]. 
-          
-IMAGE INFO:
-- Original Dimensions: ${sourceImage.width}x${sourceImage.height}
-- Point is relative to 1000x1000 grid.
+          { text: `TASK: Pixel-Precise Architectural Extraction.
+IMAGE SIZE: ${sourceImage.width}w x ${sourceImage.height}h
+CLICK POINT: x:${Math.round(rawX)}, y:${Math.round(rawY)}
+
+Find the exact rectangular panel containing this click point.
+The collage uses white/black divider strips (gutters).
 
 RULES:
-1. Identify the PHYSICAL boundaries (gutters or divider lines) of the sub-image at the specified coordinates.
-2. Return ONLY the JSON for that specific panel.
-3. Box must be tightly fitted to the panel content.
-4. COORDINATE SYSTEM: 0-1000 for x, y, width, height.
+1. Identify the solid color gutters surrounding this panel.
+2. The coordinates MUST be strictly INSIDE the gutters.
+3. ABSOLUTE REJECTION: Do NOT include even 1 pixel of the white/black divider line.
+4. Align the box perfectly to the photograph edges.
 
-Output ONLY a JSON object with 'x', 'y', 'width', 'height'.` }
+RETURN: JSON object with 'x', 'y', 'width', 'height' in PIXELS relative to the image size (${sourceImage.width}x${sourceImage.height}).` }
         ],
         config: { 
           responseMimeType: "application/json",
           responseSchema: {
-            type: Type.ARRAY, // Using array just in case model wants to wrap it, but logic expects object
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                x: { type: Type.NUMBER },
-                y: { type: Type.NUMBER },
-                width: { type: Type.NUMBER },
-                height: { type: Type.NUMBER }
-              },
-              required: ["x", "y", "width", "height"]
-            }
+            type: Type.OBJECT,
+            properties: {
+              x: { type: Type.NUMBER },
+              y: { type: Type.NUMBER },
+              width: { type: Type.NUMBER },
+              height: { type: Type.NUMBER }
+            },
+            required: ["x", "y", "width", "height"]
           }
         }
       });
@@ -461,48 +617,19 @@ Output ONLY a JSON object with 'x', 'y', 'width', 'height'.` }
       
       if (!box) return;
 
-      const sx = (box.x / 1000) * sourceImage.width;
-      const sy = (box.y / 1000) * sourceImage.height;
-      const sw = (box.width / 1000) * sourceImage.width;
-      const sh = (box.height / 1000) * sourceImage.height;
+      // Programmatic Refinement for 100% Accuracy
+      const refined = refineRectWithPixels(
+        { x: box.x, y: box.y, width: box.width, height: box.height }, 
+        sourceImage
+      );
 
-      // Extract high-res
-      const rawCanvas = document.createElement('canvas');
-      rawCanvas.width = sw;
-      rawCanvas.height = sh;
-      const rawCtx = rawCanvas.getContext('2d');
-      if (rawCtx) {
-        rawCtx.drawImage(sourceImage, sx, sy, sw, sh, 0, 0, sw, sh);
-        
-        const targetMinDim = 2048;
-        let outputWidth = sw;
-        let outputHeight = sh;
-        const aspectRatio = sw / sh;
-        if (sw < targetMinDim || sh < targetMinDim) {
-           if (aspectRatio > 1) { outputWidth = targetMinDim; outputHeight = targetMinDim / aspectRatio; }
-           else { outputHeight = targetMinDim; outputWidth = targetMinDim * aspectRatio; }
-        }
+      const sx = refined.x;
+      const sy = refined.y;
+      const sw = refined.width;
+      const sh = refined.height;
 
-        const upscaleCanvas = document.createElement('canvas');
-        upscaleCanvas.width = outputWidth;
-        upscaleCanvas.height = outputHeight;
-        const upscaleCtx = upscaleCanvas.getContext('2d');
-        if (upscaleCtx) {
-          upscaleCtx.imageSmoothingEnabled = true;
-          upscaleCtx.imageSmoothingQuality = 'high';
-          upscaleCtx.drawImage(rawCanvas, 0, 0, outputWidth, outputHeight);
-          sharpenImage(upscaleCanvas);
-
-          const newImg = {
-            id: Math.random().toString(36).substr(2, 9),
-            url: upscaleCanvas.toDataURL('image/png'),
-            rect: { x: sx, y: sy, width: sw, height: sh },
-            originalWidth: Math.round(outputWidth),
-            originalHeight: Math.round(outputHeight)
-          };
-          setExtractedImages(prev => [...prev, newImg]);
-        }
-      }
+      // Instead of immediate extraction, set as selection for user preview/editing
+      setSelection({ x: sx, y: sy, width: sw, height: sh });
     } catch (error) {
       console.error("Smart detect failed:", error);
     } finally {
@@ -516,30 +643,93 @@ Output ONLY a JSON object with 'x', 'y', 'width', 'height'.` }
     setIsDetecting(true);
 
     try {
-      // Get base64 - Increase resolution for better boundary detection
+      // 1. Attempt Programmatic Grid Detection First (Ultra-Reliable for architectural grids)
+      const gridRects = autoDetectGridProgrammatic(sourceImage);
+      if (gridRects.length >= 2) {
+        const newExtractions: ExtractedImage[] = [];
+        
+        for (const rect of gridRects) {
+          // Refine each grid rectangle to be pixel-perfect with gutters
+          const refined = refineRectWithPixels(rect, sourceImage);
+          
+          const sx = refined.x;
+          const sy = refined.y;
+          const sw = refined.width;
+          const sh = refined.height;
+
+          // 1:1 Raw Extraction
+          const rawCanvas = document.createElement('canvas');
+          rawCanvas.width = sw;
+          rawCanvas.height = sh;
+          const rawCtx = rawCanvas.getContext('2d', { alpha: false });
+          if (rawCtx) {
+            rawCtx.drawImage(sourceImage, sx, sy, sw, sh, 0, 0, sw, sh);
+            
+            // High-Res Upscale Phase
+            const targetMinDim = 2048;
+            let outputWidth = sw;
+            let outputHeight = sh;
+            const aspectRatio = sw / sh;
+            if (sw < targetMinDim || sh < targetMinDim) {
+               if (aspectRatio > 1) { outputWidth = targetMinDim; outputHeight = targetMinDim / aspectRatio; }
+               else { outputHeight = targetMinDim; outputWidth = targetMinDim * aspectRatio; }
+            }
+
+            const upscaleCanvas = document.createElement('canvas');
+            upscaleCanvas.width = outputWidth;
+            upscaleCanvas.height = outputHeight;
+            const upscaleCtx = upscaleCanvas.getContext('2d', { alpha: false });
+            if (upscaleCtx) {
+              upscaleCtx.imageSmoothingEnabled = true;
+              upscaleCtx.imageSmoothingQuality = 'high';
+              upscaleCtx.drawImage(rawCanvas, 0, 0, outputWidth, outputHeight);
+              sharpenImage(upscaleCanvas);
+
+              newExtractions.push({
+                id: Math.random().toString(36).substr(2, 9),
+                url: upscaleCanvas.toDataURL('image/png'),
+                rect: { x: sx, y: sy, width: sw, height: sh },
+                originalWidth: Math.round(outputWidth),
+                originalHeight: Math.round(outputHeight)
+              });
+            }
+          }
+        }
+        
+        setExtractedImages(prev => [...prev, ...newExtractions]);
+        setIsDetecting(false);
+        return;
+      }
+
+      // 2. Fallback to AI for complex/irregular layouts
       const canvas = document.createElement('canvas');
-      const maxDim = 1536; 
+      const maxDim = 2048; 
       const scale = Math.min(maxDim / sourceImage.width, maxDim / sourceImage.height);
       canvas.width = sourceImage.width * scale;
       canvas.height = sourceImage.height * scale;
       const ctx = canvas.getContext('2d');
-      ctx?.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
-      const base64 = canvas.toDataURL('image/jpeg', 0.95).split(',')[1];
+      if (ctx) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
+      }
+      const base64 = canvas.toDataURL('image/jpeg', 0.9).split(',')[1];
 
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: [
           { inlineData: { mimeType: 'image/jpeg', data: base64 } },
-          { text: `INSTRUCTION: You are a professional image technician. Your task is to identify the EXACT physical boundaries of every individual panel within this collage.
-          
-CRITICAL RULES:
-1. PHYSICAL SEAMS: Look for gutters, white/black divider lines, or sharp content transitions that define the physical edge of a panel.
-2. NO SUBJECT CROPPING: Do NOT crop around people or objects. You MUST capture the full rectangular panel area from edge to edge.
-3. ZERO OVERLAP: Ensure bounding boxes do not include pixels from neighboring panels. If there is a gutter/line between panels, the box should stop exactly at the edge of the panel content.
-4. ASPECT RATIO: Maintain the true intended aspect ratio of each original panel.
-5. EXHAUSTIVE: Identify EVERY panel shown in the image.
+          { text: `TASK: Hierarchical Panel Segmentation for Architectural Collages.
+IMAGE SIZE: ${sourceImage.width}w x ${sourceImage.height}h
 
-Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. Coordinate scale is 0-1000 relative to the image size. Output ONLY the raw JSON array.` }
+The collage may have different vertical dividers for different rows.
+INSTRUCTIONS:
+1. Identify global horizontal gutters to find major rows.
+2. Inside each row, find the specific vertical gutters. These may NOT align between rows.
+3. Box each individual photo panel precisely, excluding all gutter pixels.
+4. Align the boxes perfectly against the inner edges of the white/black dividers.
+
+RETURN: A JSON array of objects {x, y, width, height} in PIXELS.` }
         ],
         config: { 
           responseMimeType: "application/json",
@@ -563,10 +753,16 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
       const newExtractions: ExtractedImage[] = [];
 
       boxes.forEach((box: any) => {
-        const sx = (box.x / 1000) * sourceImage.width;
-        const sy = (box.y / 1000) * sourceImage.height;
-        const sw = (box.width / 1000) * sourceImage.width;
-        const sh = (box.height / 1000) * sourceImage.height;
+        // Programmatic Refinement for 100% Accuracy
+        const refined = refineRectWithPixels(
+          { x: box.x, y: box.y, width: box.width, height: box.height }, 
+          sourceImage
+        );
+
+        const sx = refined.x;
+        const sy = refined.y;
+        const sw = refined.width;
+        const sh = refined.height;
 
         // Apply same High-Precision flow to AI detected panels
         const rawCanvas = document.createElement('canvas');
@@ -1146,7 +1342,7 @@ Output the results as a JSON array of objects with 'x', 'y', 'width', 'height'. 
           </div>
           <div className="flex items-center gap-2">
             <kbd className="bg-bg border border-border px-1 rounded text-accent font-mono text-[9px] shadow-sm">CLICK</kbd>
-            <span className="uppercase opacity-60">Smart Select</span>
+            <span className="uppercase opacity-60">Smart Select (Edit)</span>
           </div>
         </div>
 
