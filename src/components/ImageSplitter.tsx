@@ -477,7 +477,7 @@ export default function ImageSplitter() {
   };
 
   const autoDetectGridProgrammatic = (img: HTMLImageElement): Rect[] => {
-    // Advanced Structural Analysis: Hierarchical Row-then-Column scanning
+    // Advanced Structural Analysis: Recursive Splitting
     const canvas = document.createElement('canvas');
     const scale = 0.2; 
     canvas.width = img.width * scale;
@@ -490,69 +490,90 @@ export default function ImageSplitter() {
     const isGutter = (r: number, g: number, b: number) => {
       const bri = (r + g + b) / 3;
       const var_val = Math.max(r,g,b) - Math.min(r,g,b);
-      return var_val < 25 && (bri > 190 || bri < 55);
+      // Architectural gutters are neutral (white or black) and high-brightness or low-brightness
+      return var_val < 25 && (bri > 185 || bri < 65);
     };
 
-    // Helper for finding continuous regions between gutters
-    const findRegions = (gutters: boolean[], size: number) => {
-      const regions: {start: number, end: number}[] = [];
+    const findRegionsRecursive = (rx: number, ry: number, rw: number, rh: number): Rect[] => {
+      if (rw < canvas.width * 0.05 || rh < canvas.height * 0.05) return [];
+
+      // 1. Check for Vertical Gutters spanning full height of this region
+      const colGutter = new Array(Math.round(rw)).fill(0);
+      for (let x = 0; x < rw; x++) {
+        for (let y = 0; y < rh; y++) {
+          const idx = (Math.round(ry + y) * canvas.width + Math.round(rx + x)) * 4;
+          if (isGutter(data[idx], data[idx+1], data[idx+2])) colGutter[x]++;
+        }
+      }
+
+      const colRegions: Rect[] = [];
       let inContent = false;
       let start = 0;
-      for (let i = 0; i < size; i++) {
-        if (!gutters[i] && !inContent) {
+      for (let x = 0; x < rw; x++) {
+        const isGutterLine = colGutter[x] > rh * 0.94;
+        if (!isGutterLine && !inContent) {
           inContent = true;
-          start = i;
-        } else if (gutters[i] && inContent) {
+          start = x;
+        } else if (isGutterLine && inContent) {
           inContent = false;
-          if (i - start > size * 0.05) regions.push({start, end: i});
+          if (x - start > rw * 0.05) colRegions.push({ x: rx + start, y: ry, width: x - start, height: rh });
         }
       }
-      if (inContent) regions.push({start, end: size});
-      return regions;
+      if (inContent) colRegions.push({ x: rx + start, y: ry, width: rw - start, height: rh });
+
+      // If we found multiple columns, recurse into each to find rows
+      if (colRegions.length > 1) {
+        let results: Rect[] = [];
+        colRegions.forEach(col => {
+          results = results.concat(findRegionsRecursive(col.x, col.y, col.width, col.height));
+        });
+        return results;
+      }
+
+      // 2. Check for Horizontal Gutters spanning full width of this region
+      const rowGutter = new Array(Math.round(rh)).fill(0);
+      for (let y = 0; y < rh; y++) {
+        for (let x = 0; x < rw; x++) {
+          const idx = (Math.round(ry + y) * canvas.width + Math.round(rx + x)) * 4;
+          if (isGutter(data[idx], data[idx+1], data[idx+2])) rowGutter[y]++;
+        }
+      }
+
+      const rowRegions: Rect[] = [];
+      inContent = false;
+      start = 0;
+      for (let y = 0; y < rh; y++) {
+        const isGutterLine = rowGutter[y] > rw * 0.94;
+        if (!isGutterLine && !inContent) {
+          inContent = true;
+          start = y;
+        } else if (isGutterLine && inContent) {
+          inContent = false;
+          if (y - start > rh * 0.05) rowRegions.push({ x: rx, y: ry + start, width: rw, height: y - start });
+        }
+      }
+      if (inContent) rowRegions.push({ x: rx, y: ry + start, width: rw, height: rh - start });
+
+      // If we found multiple rows, recurse into each to find columns
+      if (rowRegions.length > 1) {
+        let results: Rect[] = [];
+        rowRegions.forEach(row => {
+          results = results.concat(findRegionsRecursive(row.x, row.y, row.width, row.height));
+        });
+        return results;
+      }
+
+      // Base case: No more dividers found
+      return [{ x: rx, y: ry, width: rw, height: rh }];
     };
 
-    // 1. Detect GLOBAL ROWS
-    const rowGutter = new Array(canvas.height).fill(0);
-    for (let y = 0; y < canvas.height; y++) {
-      for (let x = 0; x < canvas.width; x++) {
-        const idx = (y * canvas.width + x) * 4;
-        if (isGutter(data[idx], data[idx+1], data[idx+2])) {
-          rowGutter[y]++;
-        }
-      }
-    }
-    const rowGutterB = rowGutter.map(count => count > canvas.width * 0.96);
-    const rowRegions = findRegions(rowGutterB, canvas.height);
-
-    const finalRects: Rect[] = [];
-
-    // 2. For each ROW, detect COLUMNS independently
-    rowRegions.forEach(row => {
-      const colGutter = new Array(canvas.width).fill(0);
-      for (let x = 0; x < canvas.width; x++) {
-        for (let y = row.start; y < row.end; y++) {
-          const idx = (y * canvas.width + x) * 4;
-          if (isGutter(data[idx], data[idx+1], data[idx+2])) {
-            colGutter[x]++;
-          }
-        }
-      }
-
-      const rowHeight = row.end - row.start;
-      const colGutterB = colGutter.map(count => count > rowHeight * 0.96);
-      const colRegions = findRegions(colGutterB, canvas.width);
-      
-      colRegions.forEach(col => {
-        finalRects.push({
-          x: col.start / scale,
-          y: row.start / scale,
-          width: (col.end - col.start) / scale,
-          height: (row.end - row.start) / scale
-        });
-      });
-    });
-
-    return finalRects;
+    const detected = findRegionsRecursive(0, 0, canvas.width, canvas.height);
+    return detected.map(r => ({
+      x: r.x / scale,
+      y: r.y / scale,
+      width: r.width / scale,
+      height: r.height / scale
+    }));
   };
 
   const smartDetectAtPoint = async (rawX: number, rawY: number) => {
@@ -581,20 +602,25 @@ export default function ImageSplitter() {
         model: "gemini-3-flash-preview",
         contents: [
           { inlineData: { mimeType: 'image/jpeg', data: base64 } },
-          { text: `TASK: Pixel-Precise Architectural Extraction.
+          { text: `TASK: Implicit Boundary Detection in Seamless Architectural Collages.
 IMAGE SIZE: ${sourceImage.width}w x ${sourceImage.height}h
 CLICK POINT: x:${Math.round(rawX)}, y:${Math.round(rawY)}
 
-Find the exact rectangular panel containing this click point.
-The collage uses white/black divider strips (gutters).
+INSTRUCTIONS:
+Detect the exact rectangular boundary of the frame containing the click point.
+This image may be a multi-frame collage without explicit separators (no white/black borders).
+
+DETECTION CRITERIA:
+1. Identify frame boundaries using only geometric discontinuities, alignment breaks, and composition shifts.
+2. Look for abrupt changes in perspective, camera angle, object scale, lighting direction, or spatial continuity.
+3. Treat any sudden misalignment of architectural lines, edges, or perspective grids as a hard separation between frames.
+4. Isolate ONLY this frame without blending into adjacent regions.
 
 RULES:
-1. Identify the solid color gutters surrounding this panel.
-2. The coordinates MUST be strictly INSIDE the gutters.
-3. ABSOLUTE REJECTION: Do NOT include even 1 pixel of the white/black divider line.
-4. Align the box perfectly to the photograph edges.
+- Zero content alteration. 
+- No inclusion of neighboring frame pixels.
 
-RETURN: JSON object with 'x', 'y', 'width', 'height' in PIXELS relative to the image size (${sourceImage.width}x${sourceImage.height}).` }
+RETURN: JSON object {x, y, width, height} in pixels relative to ${sourceImage.width}x${sourceImage.height}.` }
         ],
         config: { 
           responseMimeType: "application/json",
@@ -719,17 +745,23 @@ RETURN: JSON object with 'x', 'y', 'width', 'height' in PIXELS relative to the i
         model: "gemini-3-flash-preview",
         contents: [
           { inlineData: { mimeType: 'image/jpeg', data: base64 } },
-          { text: `TASK: Hierarchical Panel Segmentation for Architectural Collages.
+          { text: `TASK: Forensic Layout-Geometric Collage Splitting (Implicit Boundaries).
 IMAGE SIZE: ${sourceImage.width}w x ${sourceImage.height}h
 
-The collage may have different vertical dividers for different rows.
 INSTRUCTIONS:
-1. Identify global horizontal gutters to find major rows.
-2. Inside each row, find the specific vertical gutters. These may NOT align between rows.
-3. Box each individual photo panel precisely, excluding all gutter pixels.
-4. Align the boxes perfectly against the inner edges of the white/black dividers.
+1. Detect frame boundaries using only geometric discontinuities, alignment breaks, and composition shifts across the image.
+2. Identify abrupt changes in perspective, camera angle, object scale, lighting direction, or spatial continuity as implicit boundaries.
+3. Do not rely on visible borders, colors, or empty gaps.
+4. Treat any sudden misalignment of architectural lines, edges, or perspective grids as a hard separation between frames.
+5. Infer a grid-like structure by extending consistent vertical and horizontal alignment breaks across the image to reconstruct hidden frame divisions.
+6. Each detected region must form a clean rectangular frame with coherent internal perspective and composition.
+7. Strictly isolate each frame without blending or crossing into adjacent regions, even if textures or objects appear visually continuous.
 
-RETURN: A JSON array of objects {x, y, width, height} in PIXELS.` }
+RULES:
+- Return the full list of ALL rectangular frames detected.
+- Zero content alteration.
+
+RETURN: A JSON array of objects {x, y, width, height} in pixels relative to ${sourceImage.width}x${sourceImage.height}.` }
         ],
         config: { 
           responseMimeType: "application/json",
